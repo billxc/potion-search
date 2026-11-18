@@ -1,0 +1,29 @@
+{
+  "name": "potion-search",
+  "version": "0.1.0",
+  "description": "Zero-dependency Chinese/English hybrid search engine (potion-multilingual-128M static Int8 embeddings + Intl.Segmenter BM25 + RRF) for Node.js >= 20.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/billxc/potion-search.git"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "potion-search": "./bin/potion-search.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
