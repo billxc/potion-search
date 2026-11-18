@@ -362,6 +362,7 @@ export function loadVocab(vocabDir = getVocabCacheDir(), { preloadVectors = fals
   );
 
   let table = null;
+  const vecPath = path.join(vocabDir, "vectors.i8");
   let vecFd = fs.openSync(vecPath, "r");
   if (preloadVectors) {
     const i8Buf = fs.readFileSync(vecPath);
