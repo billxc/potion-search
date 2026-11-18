@@ -1,6 +1,6 @@
 {
   "name": "potion-search",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-dependency Chinese/English hybrid search engine (potion-multilingual-128M static Int8 embeddings + Intl.Segmenter BM25 + RRF) for Node.js >= 20.",
   "type": "module",
   "license": "MIT",

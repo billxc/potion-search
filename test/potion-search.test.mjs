@@ -13,10 +13,15 @@ import {
   buildBm25FromEncodedTerms,
   writeIndexFiles,
   loadIndexFiles,
-  queryHybridIndex
+  queryHybridIndex,
+  syncHybridIndex,
+  packIndexBundle,
+   extractTarGzFlat,
+  openHybridIndex
 } from "../src/index.mjs";
+import { walkMarkdownFiles } from "../bin/potion-search.mjs";
 
-test("hybrid search ranks matching Chinese and English chunks", async () => {
+test("hybrid search, BM25 binary hash table, OOV guard, and close()", async () => {
   const vocabDir = await ensureVocab();
   const vocab = loadVocab(vocabDir, { preloadVectors: false });
 
@@ -59,18 +64,87 @@ test("hybrid search ranks matching Chinese and English chunks", async () => {
     assert.equal(res2.vecRanked[0].idx, 1);
     assert.equal(res2.bm25Ranked[0].idx, 1);
 
-    // 1. All-OOV / pure symbol query must return empty vecRanked instead of index 0..N
     const oovRes = queryHybridIndex("~~~ $$$ ^^^", index, vocab);
     assert.equal(oovRes.vecRanked.length, 0);
 
-    // 2. Compound tokens with +, -, ., # (c++, utf-8, node.js) produce non-zero embeddings
     const cppVec = embedText("c++ utf-8 node.js", vocab, new Float32Array(DIM));
     assert.ok(cppVec.some((v) => v !== 0));
 
-    // 3. Idempotent FD cleanup
     index.close();
     index.close();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("walkMarkdownFiles preserves nested relative paths, syncHybridIndex two-stage incremental, packIndexBundle, and openHybridIndex", async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "potion-store-test-"));
+  const docsDir = path.join(tmpRoot, "docs");
+  const idxDir = path.join(tmpRoot, "index");
+  const unpackDir = path.join(tmpRoot, "unpacked");
+  const bundlePath = path.join(tmpRoot, "bundle.tar.gz");
+
+  try {
+    fs.mkdirSync(path.join(docsDir, "sub1"), { recursive: true });
+    fs.mkdirSync(path.join(docsDir, "sub2"), { recursive: true });
+    fs.writeFileSync(
+      path.join(docsDir, "sub1", "Overview.md"),
+      "# WebView2 Mac Overview\nUsing lldb to debug WebView2 Mac crash dump and Mojo IPC."
+    );
+    fs.writeFileSync(
+      path.join(docsDir, "sub2", "Overview.md"),
+      "# Deprecated Legacy Guide\nOld deprecated instructions for legacy proxy setup."
+    );
+
+    const walked = walkMarkdownFiles(docsDir).map((f) => f.sourceId).sort();
+    assert.deepEqual(walked, ["sub1/Overview.md", "sub2/Overview.md"]);
+
+    const loadedCalls = [];
+    const sourcesState = [
+      { sourceId: "sub1/Overview.md", stamp: "v1" },
+      { sourceId: "sub2/Overview.md", stamp: "v1" }
+    ];
+
+    const r1 = await syncHybridIndex(idxDir, {
+      listSources: () => sourcesState,
+      loadChunks: (changed) => {
+        loadedCalls.push(changed.map((c) => c.sourceId));
+        return changed.map((c) => ({
+          sourceId: c.sourceId,
+          groupKey: c.sourceId,
+          h: c.sourceId,
+          s: fs.readFileSync(path.join(docsDir, c.sourceId), "utf8"),
+          text: fs.readFileSync(path.join(docsDir, c.sourceId), "utf8")
+        }));
+      }
+    });
+    assert.equal(r1.updatedSources, 2);
+    assert.equal(loadedCalls.length, 1);
+
+    // Unchanged run -> 0 loadChunks calls
+    const r2 = await syncHybridIndex(idxDir, {
+      listSources: () => sourcesState,
+      loadChunks: () => {
+        throw new Error("Should not be called when stamps match");
+      }
+    });
+    assert.equal(r2.updatedSources, 0);
+
+    // Pack read-only bundle -> strips doc-terms.txt and fileStamps
+    packIndexBundle(idxDir, bundlePath);
+    extractTarGzFlat(bundlePath, unpackDir);
+    assert.equal(fs.existsSync(path.join(unpackDir, "doc-terms.txt")), false);
+    const bundledMeta = JSON.parse(fs.readFileSync(path.join(unpackDir, "meta.json"), "utf8"));
+    assert.equal(bundledMeta.fileStamps, undefined);
+
+    const store = await openHybridIndex(unpackDir);
+    const hits = store.search("Overview", {
+      topK: 2,
+      adjustScore: (gk, _c, s) => (gk.includes("sub2") ? s * 0.1 : s)
+    });
+    assert.equal(hits[0].path, "sub1/Overview.md");
+    store.close();
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

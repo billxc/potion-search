@@ -625,6 +625,12 @@ export function encodeChunkTerms(text) {
   return parts.join("\t");
 }
 
+function nextPow2(n) {
+  let p = 1024;
+  while (p < n) p <<= 1;
+  return p;
+}
+
 export function buildBm25FromEncodedTerms(encodedTermLines) {
   const numChunks = encodedTermLines.length;
   const docLens = new Uint16Array(numChunks);
@@ -657,26 +663,77 @@ export function buildBm25FromEncodedTerms(encodedTermLines) {
   }
 
   const avgLen = totalLen / numChunks || 1;
-  let totalPostings = 0;
-  for (const list of postingsMap.values()) totalPostings += list.length;
+  const numTerms = postingsMap.size;
+  const hashCap = nextPow2(Math.max(1024, numTerms * 2 + 64));
+  const hashMask = hashCap - 1;
 
-  const postingsU32 = new Uint32Array(totalPostings);
-  const lines = [`#avgLen=${avgLen}`];
-  let cursor = 0;
+  // Binary FNV-1a open-addressing hash table for BM25 terms:
+  //   slot layout (16 bytes per slot, 4 x Int32):
+  //     [0] hashKey (signed 32-bit FNV-1a)
+  //     [1] strOffset (or -1 if empty)
+  //     [2] strByteLen
+  //     [3] postingsStartIdx
+  //     plus df stored in a separate Uint32Array(hashCap) or packed.
+  //   Using 5 x Int32 per slot = 20 bytes: [hashKey, strOff, strLen, postStart, df]
+  const slotI32 = new Int32Array(hashCap * 5);
+  for (let i = 0; i < hashCap; i++) slotI32[i * 5 + 1] = -1;
+
+  let totalPostings = 0;
+  const termBufs = new Array(numTerms);
+  let termBytes = 0;
+  let termIdx = 0;
+
   for (const [term, list] of postingsMap) {
-    lines.push(`${term}\t${cursor}\t${list.length}`);
-    for (let j = 0; j < list.length; j++) postingsU32[cursor++] = list[j];
+    totalPostings += list.length;
+    const tb = Buffer.from(term, "utf8");
+    termBufs[termIdx++] = tb;
+    termBytes += tb.byteLength;
   }
 
-  const rawTerms = "\n" + lines.join("\n") + "\n";
-  const rawBin = Buffer.allocUnsafe(docLens.byteLength + postingsU32.byteLength);
-  Buffer.from(docLens.buffer, docLens.byteOffset, docLens.byteLength).copy(rawBin, 0);
-  Buffer.from(postingsU32.buffer, postingsU32.byteOffset, postingsU32.byteLength).copy(
-    rawBin,
-    docLens.byteLength
-  );
+  const postingsU32 = new Uint32Array(totalPostings);
+  const termsRawBuf = Buffer.concat(termBufs, termBytes);
 
-  return { avgLen, rawTerms, rawBin };
+  let postCursor = 0;
+  let strCursor = 0;
+  let tIdx = 0;
+
+  for (const [term, list] of postingsMap) {
+    const tb = termBufs[tIdx++];
+    const h = fnv1a(term);
+    let slot = h & hashMask;
+    while (slotI32[slot * 5 + 1] !== -1) {
+      slot = (slot + 1) & hashMask;
+    }
+    const base = slot * 5;
+    slotI32[base] = h | 0;
+    slotI32[base + 1] = strCursor;
+    slotI32[base + 2] = tb.byteLength;
+    slotI32[base + 3] = postCursor;
+    slotI32[base + 4] = list.length;
+
+    strCursor += tb.byteLength;
+    for (let j = 0; j < list.length; j++) {
+      postingsU32[postCursor++] = list[j];
+    }
+  }
+
+  // Header (16 bytes): [magic=0x32354d42 ("BM25"), hashCap, numChunks, termsByteLen] + Float64 avgLen (8 bytes) = 24 bytes
+  const hdrBuf = Buffer.allocUnsafe(24);
+  hdrBuf.writeUInt32LE(0x32354d42, 0);
+  hdrBuf.writeUInt32LE(hashCap, 4);
+  hdrBuf.writeUInt32LE(numChunks, 8);
+  hdrBuf.writeUInt32LE(termsRawBuf.byteLength, 12);
+  hdrBuf.writeDoubleLE(avgLen, 16);
+
+  const rawBin = Buffer.concat([
+    hdrBuf,
+    Buffer.from(slotI32.buffer, slotI32.byteOffset, slotI32.byteLength),
+    Buffer.from(docLens.buffer, docLens.byteOffset, docLens.byteLength),
+    Buffer.from(postingsU32.buffer, postingsU32.byteOffset, postingsU32.byteLength),
+    termsRawBuf
+  ]);
+
+  return { avgLen, rawBin };
 }
 
 export function buildBm25InvertedBuffers(textsForBm25) {
@@ -715,7 +772,6 @@ export function writeIndexFiles(indexDir, metaObj, vecI8, vecScales, bm25, encod
     path.join(stageDir, "chunks.scale.f32"),
     Buffer.from(vecScales.buffer, vecScales.byteOffset, vecScales.byteLength)
   );
-  fs.writeFileSync(path.join(stageDir, "bm25.txt"), bm25.rawTerms, "utf8");
   fs.writeFileSync(path.join(stageDir, "bm25.bin"), bm25.rawBin);
   if (encodedTermLines) {
     fs.writeFileSync(path.join(stageDir, "doc-terms.txt"), encodedTermLines.join("\n"), "utf8");
@@ -735,7 +791,6 @@ export function hasIndexFiles(indexDir) {
     fs.existsSync(path.join(indexDir, "chunks.offsets.u32")) &&
     fs.existsSync(path.join(indexDir, "chunks.i8")) &&
     fs.existsSync(path.join(indexDir, "chunks.scale.f32")) &&
-    fs.existsSync(path.join(indexDir, "bm25.txt")) &&
     fs.existsSync(path.join(indexDir, "bm25.bin"))
   );
 }
@@ -788,10 +843,27 @@ export function loadIndexFiles(indexDir, { lazyChunks = true, loadDocTerms = fal
     scaleBuf.buffer.slice(scaleBuf.byteOffset, scaleBuf.byteOffset + scaleBuf.byteLength)
   );
 
-  const rawTerms = fs.readFileSync(path.join(indexDir, "bm25.txt"), "utf8");
-  const firstNl = rawTerms.indexOf("\n", 1);
-  const avgLen = Number(rawTerms.slice("\n#avgLen=".length, firstNl)) || 1;
   const rawBin = fs.readFileSync(path.join(indexDir, "bm25.bin"));
+  const magic = rawBin.readUInt32LE(0);
+  if (magic !== 0x32354d42) {
+    throw new Error(`Invalid bm25.bin header magic in ${indexDir} (rebuild index required)`);
+  }
+  const bm25HashCap = rawBin.readUInt32LE(4);
+  const bm25TermsByteLen = rawBin.readUInt32LE(12);
+  const avgLen = rawBin.readDoubleLE(16) || 1;
+
+  const slotsByteOff = 24;
+  const slotsByteLen = bm25HashCap * 20;
+  const docLensByteOff = slotsByteOff + slotsByteLen;
+  const docLensByteLen = numChunks * 2;
+  const postingsByteOff = docLensByteOff + docLensByteLen;
+  const termsByteOff = rawBin.byteLength - bm25TermsByteLen;
+
+  const alignedSlots = rawBin.buffer.slice(
+    rawBin.byteOffset + slotsByteOff,
+    rawBin.byteOffset + slotsByteOff + slotsByteLen
+  );
+  const bm25SlotsI32 = new Int32Array(alignedSlots);
 
   let docTerms = null;
   if (loadDocTerms) {
@@ -819,8 +891,12 @@ export function loadIndexFiles(indexDir, { lazyChunks = true, loadDocTerms = fal
     vecI8,
     vecScales,
     avgLen,
-    rawTerms,
     rawBin,
+    bm25HashCap,
+    bm25SlotsI32,
+    docLensByteOff,
+    postingsByteOff,
+    termsByteOff,
     docTerms
   };
 }
@@ -829,9 +905,21 @@ export function queryHybridIndex(
   query,
   index,
   vocab,
-  { filterFn = null, maxRank = 150 } = {}
+  { filterFn = null, maxRank = 200 } = {}
 ) {
-  const { numChunks, vecI8, vecScales, avgLen, rawTerms, rawBin, getChunk } = index;
+  const {
+    numChunks,
+    vecI8,
+    vecScales,
+    avgLen,
+    rawBin,
+    bm25HashCap,
+    bm25SlotsI32,
+    docLensByteOff,
+    postingsByteOff,
+    termsByteOff,
+    getChunk
+  } = index;
   const qVec = embedText(query, vocab);
   let qHasNorm = false;
   for (let d = 0; d < DIM; d++) {
@@ -882,31 +970,43 @@ export function queryHybridIndex(
   const qTerms = [...new Set(tokenizeBm25(query))];
   const bm25Ranked = [];
 
-  if (qTerms.length > 0 && numChunks > 0) {
-    const firstNl = rawTerms.indexOf("\n", 1);
-    const postBaseOffset = numChunks * 2;
+  if (qTerms.length > 0 && numChunks > 0 && bm25HashCap > 0) {
+    const hashMask = bm25HashCap - 1;
     const scoreByDoc = new Float64Array(numChunks);
     const hitDocs = [];
 
     for (const qt of qTerms) {
-      const needle = `\n${qt}\t`;
-      const pos = rawTerms.indexOf(needle, firstNl);
-      if (pos === -1) continue;
-      const valStart = pos + needle.length;
-      const tabPos = rawTerms.indexOf("\t", valStart);
-      const lineEnd = rawTerms.indexOf("\n", tabPos);
-      const start = Number(rawTerms.slice(valStart, tabPos));
-      const df = Number(rawTerms.slice(tabPos + 1, lineEnd));
-      if (!(df > 0)) continue;
+      const h = fnv1a(qt);
+      const hSigned = h | 0;
+      let slot = h & hashMask;
+      let start = -1;
+      let df = 0;
+
+      while (true) {
+        const base = slot * 5;
+        const strOff = bm25SlotsI32[base + 1];
+        if (strOff === -1) break;
+        if (bm25SlotsI32[base] === hSigned) {
+          const strLen = bm25SlotsI32[base + 2];
+          if (rawBin.toString("utf8", termsByteOff + strOff, termsByteOff + strOff + strLen) === qt) {
+            start = bm25SlotsI32[base + 3];
+            df = bm25SlotsI32[base + 4];
+            break;
+          }
+        }
+        slot = (slot + 1) & hashMask;
+      }
+
+      if (df <= 0) continue;
 
       const idf = Math.log(1 + (numChunks - df + 0.5) / (df + 0.5));
-      let byteOff = postBaseOffset + start * 4;
+      let byteOff = postingsByteOff + start * 4;
       for (let p = 0; p < df; p++, byteOff += 4) {
         const packed = rawBin.readUInt32LE(byteOff);
         const docIdx = packed >>> 8;
         if (filterFn && vecScores[docIdx] === -Infinity) continue;
         const tf = packed & 0xff;
-        const docLen = rawBin.readUInt16LE(docIdx * 2);
+        const docLen = rawBin.readUInt16LE(docLensByteOff + docIdx * 2);
         if (scoreByDoc[docIdx] === 0) hitDocs.push(docIdx);
         scoreByDoc[docIdx] +=
           (idf * (tf * 2.2)) / (tf + 1.2 * (0.25 + (0.75 * docLen) / avgLen));
@@ -922,4 +1022,370 @@ export function queryHybridIndex(
   }
 
   return { vecRanked, bm25Ranked, vecScores };
+}
+
+/**
+ * Two-stage incremental index builder (`listSources` -> `loadChunks(changedSources)`).
+ *
+ * - `listSources()` returns `Iterable<{ sourceId: string, stamp: string | number }>`.
+ * - `loadChunks(changedItems)` receives `Array<{ sourceId, stamp, prevStamp }>` and returns
+ *   an array or async iterable of chunk descriptors:
+ *     `{ sourceId, groupKey?, h?, s?, text, bm25Text?, meta?, append?: boolean }`
+ *   When `append: true` (e.g. appended JSONL bytes), existing chunks for `sourceId` are kept
+ *   and the newly returned chunks are appended after them; otherwise existing chunks for `sourceId`
+ *   are replaced.
+ */
+export async function syncHybridIndex(
+  indexDir,
+  { listSources, loadChunks, extraMeta = {} }
+) {
+  const t0 = performance.now();
+  const sources = Array.from(await listSources());
+
+  let prevLoaded = null;
+  const prevChunksBySource = new Map();
+
+  if (hasIndexFiles(indexDir) && fs.existsSync(path.join(indexDir, "doc-terms.txt"))) {
+    try {
+      const metaOnly = JSON.parse(fs.readFileSync(path.join(indexDir, "meta.json"), "utf8"));
+      const prevStamps = metaOnly.fileStamps || {};
+      let anyChanged = Object.keys(prevStamps).length !== sources.length;
+      if (!anyChanged) {
+        for (const s of sources) {
+          if (String(prevStamps[s.sourceId]) !== String(s.stamp)) {
+            anyChanged = true;
+            break;
+          }
+        }
+      }
+      if (!anyChanged) {
+        return {
+          updatedSources: 0,
+          totalSources: sources.length,
+          chunkCount: metaOnly.chunkCount || 0,
+          elapsedMs: Math.round(performance.now() - t0)
+        };
+      }
+
+      prevLoaded = loadIndexFiles(indexDir, { lazyChunks: false, loadDocTerms: true });
+      if (prevLoaded.docTerms && prevLoaded.docTerms.length === prevLoaded.numChunks) {
+        for (let i = 0; i < prevLoaded.numChunks; i++) {
+          const c = prevLoaded.chunks[i];
+          const sid = c._srcId ?? c.p;
+          let list = prevChunksBySource.get(sid);
+          if (!list) {
+            list = [];
+            prevChunksBySource.set(sid, list);
+          }
+          list.push(i);
+        }
+      } else {
+        prevLoaded = null;
+      }
+    } catch {
+      prevLoaded = null;
+    }
+  }
+
+  const prevStamps = prevLoaded?.meta?.fileStamps || {};
+  const nextStamps = {};
+  const changedSources = [];
+
+  for (const s of sources) {
+    const stampStr = String(s.stamp);
+    nextStamps[s.sourceId] = stampStr;
+    const prevStamp = prevStamps[s.sourceId];
+    if (!prevLoaded || prevStamp === undefined || String(prevStamp) !== stampStr) {
+      changedSources.push({
+        sourceId: s.sourceId,
+        stamp: s.stamp,
+        prevStamp: prevStamp ?? null
+      });
+    }
+  }
+
+  const newBySource = new Map();
+  const appendBySource = new Set();
+
+  if (changedSources.length > 0) {
+    const vocabDir = await ensureVocab();
+    const vocab = loadVocab(vocabDir, { preloadVectors: changedSources.length > 10 });
+    const scratch = new Float32Array(DIM);
+    const loadedIter = await loadChunks(changedSources);
+
+    for await (const item of loadedIter) {
+      const sourceId = item.sourceId;
+      if (item.append) appendBySource.add(sourceId);
+      const textForVec = item.text || "";
+      const textForBm25 = item.bm25Text || textForVec;
+
+      const rowI8 = new Int8Array(DIM);
+      const rowScale = new Float32Array(1);
+      embedText(textForVec, vocab, scratch);
+      quantizeRow(scratch, rowI8, 0, rowScale);
+
+      const chunkMeta = {
+        ...(item.meta || {}),
+        _srcId: sourceId,
+        p: item.groupKey ?? item.p ?? sourceId,
+        h: item.h ?? "",
+        s: item.s ?? textForVec.replace(/\s+/g, " ").slice(0, 220)
+      };
+
+      let list = newBySource.get(sourceId);
+      if (!list) {
+        list = [];
+        newBySource.set(sourceId, list);
+      }
+      list.push({
+        chunk: chunkMeta,
+        rowI8,
+        scale: rowScale[0],
+        encodedTerms: encodeChunkTerms(textForBm25)
+      });
+    }
+  }
+
+  const changedSet = new Set(changedSources.map((c) => c.sourceId));
+  const finalChunks = [];
+  const finalDocTerms = [];
+  const rowSources = [];
+
+  for (const s of sources) {
+    const sid = s.sourceId;
+    if (!changedSet.has(sid)) {
+      const oldIndices = prevChunksBySource.get(sid) || [];
+      for (const oldIdx of oldIndices) {
+        finalChunks.push(prevLoaded.chunks[oldIdx]);
+        finalDocTerms.push(prevLoaded.docTerms[oldIdx]);
+        rowSources.push({ kind: "old", oldIdx });
+      }
+      continue;
+    }
+
+    if (appendBySource.has(sid) && prevLoaded) {
+      const oldIndices = prevChunksBySource.get(sid) || [];
+      for (const oldIdx of oldIndices) {
+        finalChunks.push(prevLoaded.chunks[oldIdx]);
+        finalDocTerms.push(prevLoaded.docTerms[oldIdx]);
+        rowSources.push({ kind: "old", oldIdx });
+      }
+    }
+
+    const added = newBySource.get(sid) || [];
+    for (const item of added) {
+      finalChunks.push(item.chunk);
+      finalDocTerms.push(item.encodedTerms);
+      rowSources.push({ kind: "new", rowI8: item.rowI8, scale: item.scale });
+    }
+  }
+
+  const numChunks = finalChunks.length;
+  const vecI8 = new Int8Array(numChunks * DIM);
+  const vecScales = new Float32Array(numChunks);
+
+  for (let i = 0; i < numChunks; i++) {
+    const src = rowSources[i];
+    if (src.kind === "new") {
+      vecI8.set(src.rowI8, i * DIM);
+      vecScales[i] = src.scale;
+    } else {
+      const oldBase = src.oldIdx * DIM;
+      vecI8.set(prevLoaded.vecI8.subarray(oldBase, oldBase + DIM), i * DIM);
+      vecScales[i] = prevLoaded.vecScales[src.oldIdx];
+    }
+  }
+
+  const bm25 = buildBm25FromEncodedTerms(finalDocTerms);
+  writeIndexFiles(
+    indexDir,
+    {
+      ...extraMeta,
+      updatedAt: new Date().toISOString(),
+      sourceCount: sources.length,
+      chunkCount: numChunks,
+      fileStamps: nextStamps,
+      chunks: finalChunks
+    },
+    vecI8,
+    vecScales,
+    bm25,
+    finalDocTerms
+  );
+
+  if (prevLoaded) prevLoaded.close();
+  return {
+    updatedSources: changedSources.length,
+    totalSources: sources.length,
+    chunkCount: numChunks,
+    elapsedMs: Math.round(performance.now() - t0)
+  };
+}
+
+/**
+ * Export a read-only release `.tar.gz` bundle from `indexDir`, stripping `doc-terms.txt`
+ * and `meta.fileStamps` so client downloads stay compact.
+ */
+export function packIndexBundle(indexDir, outArchivePath) {
+  const stageDir = `${indexDir}.bundle-${process.pid}`;
+  fs.mkdirSync(stageDir, { recursive: true });
+  try {
+    const rawMeta = JSON.parse(fs.readFileSync(path.join(indexDir, "meta.json"), "utf8"));
+    delete rawMeta.fileStamps;
+    fs.writeFileSync(path.join(stageDir, "meta.json"), JSON.stringify(rawMeta), "utf8");
+
+    const files = ["chunks.jsonl", "chunks.offsets.u32", "chunks.i8", "chunks.scale.f32", "bm25.bin"];
+    for (const f of files) {
+      fs.copyFileSync(path.join(indexDir, f), path.join(stageDir, f));
+    }
+    packTarGzFlat(stageDir, ["meta.json", ...files], outArchivePath);
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Open an index directory in read-only query mode (lazy chunk offset loading + on-demand vocab pread).
+ */
+export async function openHybridIndex(indexDir, { vocabDir = getVocabCacheDir() } = {}) {
+  const ensuredVocabDir = await ensureVocab(vocabDir);
+  const vocab = loadVocab(ensuredVocabDir, { preloadVectors: false });
+  const index = loadIndexFiles(indexDir, { lazyChunks: true });
+
+  function search(
+    query,
+    {
+      topK = 8,
+      maxRank = 200,
+      rrfK = 20,
+      maxPerGroup = 1,
+      filterFn = null,
+      adjustScore = null
+    } = {}
+  ) {
+    const { vecRanked, bm25Ranked, vecScores } = queryHybridIndex(query, index, vocab, {
+      filterFn,
+      maxRank
+    });
+    const { getChunk } = index;
+
+    if (maxPerGroup === 1) {
+      const groupScores = new Map();
+      const bestByGroup = new Map();
+
+      const seenVec = new Set();
+      let vecRank = 0;
+      for (const item of vecRanked) {
+        const c = getChunk(item.idx);
+        const gk = c.p;
+        if (seenVec.has(gk)) continue;
+        seenVec.add(gk);
+        vecRank++;
+        groupScores.set(
+          gk,
+          (groupScores.get(gk) ?? 0) + 1.0 / (rrfK + vecRank) + 0.02 * Math.max(0, item.score)
+        );
+        bestByGroup.set(gk, {
+          chunk: c,
+          vecSimilarity: Number(item.score.toFixed(4)),
+          bm25Score: null
+        });
+      }
+
+      const seenBm25 = new Set();
+      let bm25Rank = 0;
+      for (const item of bm25Ranked) {
+        const c = getChunk(item.idx);
+        const gk = c.p;
+        if (seenBm25.has(gk)) continue;
+        seenBm25.add(gk);
+        bm25Rank++;
+        const vecBonus = seenVec.has(gk) ? 0 : 0.02 * Math.max(0, vecScores[item.idx]);
+        groupScores.set(
+          gk,
+          (groupScores.get(gk) ?? 0) + 1.3 / (rrfK + bm25Rank) + vecBonus
+        );
+        const entry = bestByGroup.get(gk) ?? {
+          chunk: c,
+          vecSimilarity: Number(vecScores[item.idx].toFixed(4)),
+          bm25Score: null
+        };
+        entry.bm25Score = Number(item.score.toFixed(2));
+        if (bm25Rank <= 10) entry.chunk = c;
+        bestByGroup.set(gk, entry);
+      }
+
+      const scored = [];
+      for (const [gk, rawScore] of groupScores.entries()) {
+        const info = bestByGroup.get(gk);
+        const finalScore = adjustScore
+          ? adjustScore(gk, info.chunk, rawScore)
+          : rawScore;
+        scored.push({
+          groupKey: gk,
+          path: gk,
+          heading: info.chunk.h,
+          snippet: info.chunk.s,
+          score: Number(finalScore.toFixed(4)),
+          rrfScore: Number(finalScore.toFixed(4)),
+          vecSimilarity: info.vecSimilarity,
+          bm25Score: info.bm25Score,
+          chunk: info.chunk
+        });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      return scored.slice(0, topK);
+    }
+
+    // Per-chunk scoring with maxPerGroup cap (e.g. session-search with maxPerGroup = 2)
+    const rrfByIdx = new Map();
+    for (let r = 0; r < vecRanked.length; r++) {
+      const idx = vecRanked[r].idx;
+      rrfByIdx.set(idx, (rrfByIdx.get(idx) ?? 0) + 1.0 / (rrfK + r + 1));
+    }
+    const bm25ByIdx = new Map();
+    for (let r = 0; r < bm25Ranked.length; r++) {
+      const item = bm25Ranked[r];
+      rrfByIdx.set(item.idx, (rrfByIdx.get(item.idx) ?? 0) + 1.3 / (rrfK + r + 1));
+      bm25ByIdx.set(item.idx, item.score);
+    }
+
+    const candidates = [];
+    for (const [idx, baseRrf] of rrfByIdx.entries()) {
+      const c = getChunk(idx);
+      const gk = c.p;
+      const rawScore = baseRrf + 0.02 * Math.max(0, vecScores[idx]);
+      const finalScore = adjustScore ? adjustScore(gk, c, rawScore) : rawScore;
+      candidates.push({
+        groupKey: gk,
+        path: gk,
+        heading: c.h,
+        snippet: c.s,
+        score: Number(finalScore.toFixed(4)),
+        rrfScore: Number(finalScore.toFixed(4)),
+        vecSimilarity: Number(vecScores[idx].toFixed(4)),
+        bm25Score: bm25ByIdx.has(idx) ? Number(bm25ByIdx.get(idx).toFixed(2)) : null,
+        chunk: c
+      });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+
+    const groupCounts = new Map();
+    const out = [];
+    for (const cand of candidates) {
+      const cnt = groupCounts.get(cand.groupKey) || 0;
+      if (cnt >= maxPerGroup) continue;
+      groupCounts.set(cand.groupKey, cnt + 1);
+      out.push(cand);
+      if (out.length >= topK) break;
+    }
+    return out;
+  }
+
+  return {
+    meta: index.meta,
+    numChunks: index.numChunks,
+    search,
+    close: () => index.close()
+  };
 }

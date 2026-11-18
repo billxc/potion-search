@@ -28,20 +28,42 @@ node ./bin/potion-search.mjs "DNS DoH 证书" --dir /path/to/notes --path "netwo
 node ./bin/potion-search.mjs build-vocab --pack ./potion-vocab-v2.tar.gz
 ```
 
-## Library API
+## Library API (`HybridStore` / Two-Stage Incremental + Read-Only Search)
 
 ```js
 import {
-  ensureVocab,
-  loadVocab,
-  embedText,
-  quantizeRow,
-  encodeChunkTerms,
-  buildBm25FromEncodedTerms,
-  writeIndexFiles,
-  loadIndexFiles,
-  queryHybridIndex
+  syncHybridIndex,
+  packIndexBundle,
+  openHybridIndex
 } from "potion-search";
+
+// 1. Build / incremental sync (two-stage protocol: zero body I/O for unchanged sources)
+await syncHybridIndex(indexDir, {
+  listSources: () => [{ sourceId: "guide/mac.md", stamp: "blob_sha_or_mtime" }],
+  loadChunks: async (changedSources) => [
+    {
+      sourceId: "guide/mac.md",
+      groupKey: "guide/mac.md",
+      h: "# WebView2 Mac Guide",
+      s: "220-char preview snippet...",
+      text: "Full section text for static Int8 embedding & BM25..."
+    }
+  ]
+});
+
+// Optional: export read-only client bundle (strips doc-terms.txt and fileStamps)
+packIndexBundle(indexDir, "./index-bundle.tar.gz");
+
+// 2. Read-only query (lazy chunk offset pread + binary FNV-1a BM25 & vocab lookup)
+const store = await openHybridIndex(indexDir);
+const hits = store.search("WebView2 Mac 崩溃调试", {
+  topK: 8,
+  maxPerGroup: 1,
+  filterFn: (chunk) => true,
+  adjustScore: (groupKey, chunk, baseScore) =>
+    groupKey.toLowerCase().includes("deprecated") ? baseScore * 0.5 : baseScore
+});
+store.close();
 ```
 
 ## License
