@@ -58,6 +58,18 @@ test("hybrid search ranks matching Chinese and English chunks", async () => {
     const res2 = queryHybridIndex("日本 DNS DoH 证书", index, vocab);
     assert.equal(res2.vecRanked[0].idx, 1);
     assert.equal(res2.bm25Ranked[0].idx, 1);
+
+    // 1. All-OOV / pure symbol query must return empty vecRanked instead of index 0..N
+    const oovRes = queryHybridIndex("~~~ $$$ ^^^", index, vocab);
+    assert.equal(oovRes.vecRanked.length, 0);
+
+    // 2. Compound tokens with +, -, ., # (c++, utf-8, node.js) produce non-zero embeddings
+    const cppVec = embedText("c++ utf-8 node.js", vocab, new Float32Array(DIM));
+    assert.ok(cppVec.some((v) => v !== 0));
+
+    // 3. Idempotent FD cleanup
+    index.close();
+    index.close();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

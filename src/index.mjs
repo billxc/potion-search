@@ -29,6 +29,12 @@ const STOP_WORDS = new Set(
   )
 );
 
+const ZH_STOP_WORDS = new Set(
+  "的 了 在 是 我 有 和 就 都 一 一个 上 也 很 到 说 要 去 你 会 着 没有 看 好 自己 这 那 什么 怎么 如何 为什么 哪些 可以 我们 你们 他们 以及 或者 但是 因为 所以 如果".split(
+    " "
+  )
+);
+
 const zhSegmenter =
   typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
     ? new Intl.Segmenter("zh", { granularity: "word" })
@@ -356,11 +362,22 @@ export function loadVocab(vocabDir = getVocabCacheDir(), { preloadVectors = fals
   );
 
   let table = null;
-  const vecPath = path.join(vocabDir, "vectors.i8");
-  const vecFd = fs.openSync(vecPath, "r");
+  let vecFd = fs.openSync(vecPath, "r");
   if (preloadVectors) {
     const i8Buf = fs.readFileSync(vecPath);
     table = new Int8Array(i8Buf.buffer, i8Buf.byteOffset, i8Buf.byteLength);
+  }
+
+  function close() {
+    if (vecFd !== null) {
+      try {
+        fs.closeSync(vecFd);
+      } catch {}
+      vecFd = null;
+    }
+    if (cachedVocab && cachedVocab.vocabDir === vocabDir) {
+      cachedVocab = null;
+    }
   }
 
   function lookupTokenId(str) {
@@ -385,7 +402,10 @@ export function loadVocab(vocabDir = getVocabCacheDir(), { preloadVectors = fals
     scores,
     scales,
     table,
-    vecFd,
+    get vecFd() {
+      return vecFd;
+    },
+    close,
     rowScratch: Buffer.allocUnsafe(DIM),
     spanCache: new Map()
   };
@@ -466,7 +486,7 @@ function tokenizeSpan(raw, isCjk, vocab) {
   return ids;
 }
 
-const SPAN_RE = /[a-zA-Z0-9_]+|[一-鿿]+/g;
+const SPAN_RE = /[a-zA-Z0-9_][a-zA-Z0-9_\-.+#]*|[一-鿿]+/g;
 
 export function embedText(text, vocab, out = new Float32Array(DIM)) {
   out.fill(0);
@@ -479,7 +499,8 @@ export function embedText(text, vocab, out = new Float32Array(DIM)) {
     : new Int8Array(rowScratch.buffer, rowScratch.byteOffset, DIM);
 
   for (let p = 0; p < matches.length; p++) {
-    const raw = matches[p];
+    const raw = matches[p].replace(/[.-]+$/, "");
+    if (!raw) continue;
     const isCjk = raw.charCodeAt(0) >= 0x4e00;
     const ids = tokenizeSpan(raw, isCjk, vocab);
     for (let k = 0; k < ids.length; k++) {
@@ -497,7 +518,8 @@ export function embedText(text, vocab, out = new Float32Array(DIM)) {
 
   let normSq = 0;
   for (let d = 0; d < DIM; d++) normSq += out[d] * out[d];
-  const norm = Math.sqrt(normSq) || 1;
+  if (normSq === 0) return out;
+  const norm = Math.sqrt(normSq);
   for (let d = 0; d < DIM; d++) out[d] /= norm;
   return out;
 }
@@ -558,21 +580,27 @@ export function tokenizeBm25(text) {
       if (zhSegmenter) {
         const segSet = new Set();
         for (const seg of zhSegmenter.segment(run)) {
-          if (seg.segment) {
+          if (seg.segment && !ZH_STOP_WORDS.has(seg.segment)) {
             out.push(seg.segment);
+            segSet.add(`${seg.index}:${seg.segment.length}`);
+          } else if (seg.segment) {
             segSet.add(`${seg.index}:${seg.segment.length}`);
           }
         }
         // Add overlapping bigrams only when not already emitted as a 2-char segment at the same position
         for (let k = 0; k + 1 < run.length; k++) {
-          if (!segSet.has(`${k}:2`)) {
-            out.push(run.slice(k, k + 2));
+          const bg = run.slice(k, k + 2);
+          if (!segSet.has(`${k}:2`) && !ZH_STOP_WORDS.has(bg)) {
+            out.push(bg);
           }
         }
       } else {
         for (let k = 0; k < run.length; k++) {
-          out.push(run[k]);
-          if (k + 1 < run.length) out.push(run.slice(k, k + 2));
+          if (!ZH_STOP_WORDS.has(run[k])) out.push(run[k]);
+          if (k + 1 < run.length) {
+            const bg = run.slice(k, k + 2);
+            if (!ZH_STOP_WORDS.has(bg)) out.push(bg);
+          }
         }
       }
     }
@@ -772,10 +800,20 @@ export function loadIndexFiles(indexDir, { lazyChunks = true, loadDocTerms = fal
     }
   }
 
+  function close() {
+    if (chunksFd !== null) {
+      try {
+        fs.closeSync(chunksFd);
+      } catch {}
+      chunksFd = null;
+    }
+  }
+
   return {
     meta,
     chunks,
     getChunk,
+    close,
     numChunks,
     vecI8,
     vecScales,
@@ -794,37 +832,51 @@ export function queryHybridIndex(
 ) {
   const { numChunks, vecI8, vecScales, avgLen, rawTerms, rawBin, getChunk } = index;
   const qVec = embedText(query, vocab);
+  let qHasNorm = false;
+  for (let d = 0; d < DIM; d++) {
+    if (qVec[d] !== 0) {
+      qHasNorm = true;
+      break;
+    }
+  }
 
   const vecScores = new Float64Array(numChunks);
-  for (let i = 0; i < numChunks; i++) {
-    if (filterFn && !filterFn(getChunk(i), i)) {
-      vecScores[i] = -Infinity;
-      continue;
-    }
-    const base = i * DIM;
-    let dot = 0;
-    for (let d = 0; d < DIM; d++) {
-      dot += qVec[d] * vecI8[base + d];
-    }
-    vecScores[i] = dot * vecScales[i];
-  }
-
   const vecRanked = [];
-  if (numChunks > 4096 && !filterFn) {
-    const sample = [];
-    for (let i = 0; i < numChunks; i += 32) sample.push(vecScores[i]);
-    sample.sort((a, b) => b - a);
-    const thresh = sample[Math.min(sample.length - 1, 64)] ?? -Infinity;
+
+  if (qHasNorm) {
     for (let i = 0; i < numChunks; i++) {
-      if (vecScores[i] >= thresh) vecRanked.push({ idx: i, score: vecScores[i] });
+      if (filterFn && !filterFn(getChunk(i), i)) {
+        vecScores[i] = -Infinity;
+        continue;
+      }
+      const base = i * DIM;
+      let dot = 0;
+      for (let d = 0; d < DIM; d++) {
+        dot += qVec[d] * vecI8[base + d];
+      }
+      vecScores[i] = dot * vecScales[i];
     }
-  } else {
+
+    if (numChunks > 4096 && !filterFn) {
+      const sample = [];
+      for (let i = 0; i < numChunks; i += 32) sample.push(vecScores[i]);
+      sample.sort((a, b) => b - a);
+      const thresh = sample[Math.min(sample.length - 1, 64)] ?? -Infinity;
+      for (let i = 0; i < numChunks; i++) {
+        if (vecScores[i] >= thresh) vecRanked.push({ idx: i, score: vecScores[i] });
+      }
+    } else {
+      for (let i = 0; i < numChunks; i++) {
+        if (vecScores[i] > -Infinity) vecRanked.push({ idx: i, score: vecScores[i] });
+      }
+    }
+    vecRanked.sort((a, b) => b.score - a.score || a.idx - b.idx);
+    if (vecRanked.length > maxRank) vecRanked.length = maxRank;
+  } else if (filterFn) {
     for (let i = 0; i < numChunks; i++) {
-      if (vecScores[i] > -Infinity) vecRanked.push({ idx: i, score: vecScores[i] });
+      if (!filterFn(getChunk(i), i)) vecScores[i] = -Infinity;
     }
   }
-  vecRanked.sort((a, b) => b.score - a.score || a.idx - b.idx);
-  if (vecRanked.length > maxRank) vecRanked.length = maxRank;
 
   const qTerms = [...new Set(tokenizeBm25(query))];
   const bm25Ranked = [];
