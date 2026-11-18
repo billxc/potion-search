@@ -531,29 +531,49 @@ export function stemEnglishWord(word) {
 }
 
 export function tokenizeBm25(text) {
-  const lower = text.toLowerCase();
   const out = [];
 
-  const enMatches = lower.match(/[a-z0-9][a-z0-9_-]+/g);
-  if (enMatches) {
-    for (let i = 0; i < enMatches.length; i++) {
-      const w = enMatches[i];
+  // Split camelCase identifier parts as well as full lowercased tokens (e.g. PartitionAlloc -> partitionalloc, partition, alloc)
+  const rawEn = text.match(/[a-zA-Z0-9][a-zA-Z0-9_-]+/g);
+  if (rawEn) {
+    for (let i = 0; i < rawEn.length; i++) {
+      const raw = rawEn[i];
+      const w = raw.toLowerCase();
       if (!STOP_WORDS.has(w)) out.push(stemEnglishWord(w));
+      if (/[a-z][A-Z]/.test(raw)) {
+        const camelParts = raw.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(" ");
+        if (camelParts.length > 1) {
+          for (const cp of camelParts) {
+            if (cp.length >= 2 && !STOP_WORDS.has(cp)) out.push(stemEnglishWord(cp));
+          }
+        }
+      }
     }
   }
 
-  const zhMatches = lower.match(/[一-鿿]+/g);
+  const zhMatches = text.match(/[一-鿿]+/g);
   if (zhMatches) {
     for (let i = 0; i < zhMatches.length; i++) {
       const run = zhMatches[i];
       if (zhSegmenter) {
+        const segSet = new Set();
         for (const seg of zhSegmenter.segment(run)) {
-          if (seg.segment) out.push(seg.segment);
+          if (seg.segment) {
+            out.push(seg.segment);
+            segSet.add(`${seg.index}:${seg.segment.length}`);
+          }
         }
-      }
-      for (let k = 0; k < run.length; k++) {
-        if (!zhSegmenter) out.push(run[k]);
-        if (k + 1 < run.length) out.push(run.slice(k, k + 2));
+        // Add overlapping bigrams only when not already emitted as a 2-char segment at the same position
+        for (let k = 0; k + 1 < run.length; k++) {
+          if (!segSet.has(`${k}:2`)) {
+            out.push(run.slice(k, k + 2));
+          }
+        }
+      } else {
+        for (let k = 0; k < run.length; k++) {
+          out.push(run[k]);
+          if (k + 1 < run.length) out.push(run.slice(k, k + 2));
+        }
       }
     }
   }
